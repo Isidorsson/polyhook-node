@@ -1,0 +1,322 @@
+openapi: 3.1.0
+info:
+  title: PolyHook
+  version: 0.1.0
+  summary: Webhook bin with live SSE streaming and replay-with-retries.
+  description: |
+    A small, ephemeral webhook-receiving service. Create a bin, post anything to its
+    ingest URL, watch requests stream in real time over Server-Sent Events, and replay
+    captured requests to any target URL with exponential-backoff retries.
+
+    This spec is the **contract** — both `polyhook-go` and `polyhook-node` implement
+    it identically. Both repos commit this file verbatim.
+  contact:
+    name: Andreas Isidorsson
+    url: https://github.com/Isidorsson
+
+servers:
+  - url: https://polyhook-go.up.railway.app
+    description: Go implementation (chi + modernc/sqlite + slog)
+  - url: https://polyhook-node.up.railway.app
+    description: Node implementation (Fastify + better-sqlite3 + pino)
+
+tags:
+  - name: bins
+    description: Ephemeral webhook bins (auto-expire after 24h)
+  - name: requests
+    description: Captured webhook requests
+  - name: replays
+    description: Replay captured requests to a target URL
+  - name: ops
+    description: Operational endpoints (health, metrics)
+
+paths:
+  /v1/bins:
+    post:
+      tags: [bins]
+      summary: Create a new bin
+      operationId: createBin
+      responses:
+        "201":
+          description: Bin created. Save the delete_token; it is shown only once.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BinCreated" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/bins/{id}:
+    delete:
+      tags: [bins]
+      summary: Delete a bin (and all its requests/replays)
+      operationId: deleteBin
+      parameters:
+        - $ref: "#/components/parameters/BinId"
+        - in: header
+          name: X-Delete-Token
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Deleted }
+        "401": { description: Missing or invalid delete token }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/bins/{id}/in:
+    post:
+      tags: [requests]
+      summary: Ingest a webhook (raw body and headers preserved as-is)
+      operationId: ingestRequest
+      description: |
+        Accepts ANY HTTP method via the `X-Forwarded-Method` header override or via
+        the actual method (the server captures whichever was used). The raw body and
+        all incoming headers are stored verbatim — no parsing, no transformation.
+      parameters:
+        - $ref: "#/components/parameters/BinId"
+      requestBody:
+        required: false
+        content:
+          "*/*":
+            schema:
+              type: string
+              format: binary
+      responses:
+        "202":
+          description: Captured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RequestAccepted" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/bins/{id}/requests:
+    get:
+      tags: [requests]
+      summary: List captured requests (cursor-paginated, ETag-cacheable)
+      operationId: listRequests
+      parameters:
+        - $ref: "#/components/parameters/BinId"
+        - in: query
+          name: cursor
+          required: false
+          description: Opaque cursor returned by the previous page. Omit for the first page.
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: header
+          name: If-None-Match
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: Page of requests.
+          headers:
+            ETag:
+              schema: { type: string }
+              description: Strong validator; pass back as `If-None-Match` for 304.
+            Cache-Control:
+              schema: { type: string, example: "private, max-age=2" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RequestPage" }
+        "304": { description: Not modified — your ETag still matches. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/bins/{id}/stream:
+    get:
+      tags: [requests]
+      summary: Server-Sent Events stream of new requests
+      operationId: streamRequests
+      description: |
+        Long-lived SSE connection. Each captured request is pushed as a `request`
+        event. Supports `Last-Event-ID` resumption for missed events on reconnect.
+      parameters:
+        - $ref: "#/components/parameters/BinId"
+        - in: header
+          name: Last-Event-ID
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: SSE stream (`text/event-stream`).
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/bins/{id}/requests/{rid}/replay:
+    post:
+      tags: [replays]
+      summary: Replay a captured request to a target URL
+      operationId: replayRequest
+      parameters:
+        - $ref: "#/components/parameters/BinId"
+        - in: path
+          name: rid
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReplayRequest" }
+      responses:
+        "202":
+          description: Replay queued. Poll `/v1/replays/{replay_id}` for status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReplayQueued" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/replays/{replay_id}:
+    get:
+      tags: [replays]
+      summary: Get replay status
+      operationId: getReplay
+      parameters:
+        - in: path
+          name: replay_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Replay record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Replay" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness probe
+      operationId: health
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "ok" }
+                  uptime_seconds: { type: integer }
+                  impl: { type: string, example: "go" }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus metrics (text exposition format)
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus text format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    BinId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, pattern: "^[a-z0-9]{12}$" }
+
+  responses:
+    NotFound:
+      description: Bin or resource not found (or expired).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+        X-RateLimit-Limit:
+          schema: { type: integer }
+        X-RateLimit-Remaining:
+          schema: { type: integer }
+        X-RateLimit-Reset:
+          schema: { type: integer, description: "Unix epoch seconds" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    BinCreated:
+      type: object
+      required: [id, ingest_url, view_url, delete_token, expires_at]
+      properties:
+        id: { type: string, example: "k3p9q2x7m1nb" }
+        ingest_url: { type: string, format: uri }
+        view_url: { type: string, format: uri }
+        delete_token: { type: string, description: "Shown once. Required to DELETE the bin." }
+        expires_at: { type: string, format: date-time }
+
+    RequestAccepted:
+      type: object
+      required: [request_id, received_at]
+      properties:
+        request_id: { type: string }
+        received_at: { type: string, format: date-time }
+
+    CapturedRequest:
+      type: object
+      required: [id, method, headers, body_size, received_at]
+      properties:
+        id: { type: string }
+        method: { type: string, example: "POST" }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: All headers as received, lowercased keys.
+        body_size: { type: integer, description: "Bytes." }
+        body_b64: { type: string, description: "Base64 of the raw body. Omitted from list endpoints; present on detail." }
+        received_at: { type: string, format: date-time }
+
+    RequestPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CapturedRequest" }
+        next_cursor:
+          type: string
+          nullable: true
+
+    ReplayRequest:
+      type: object
+      required: [target_url]
+      properties:
+        target_url: { type: string, format: uri }
+        max_retries: { type: integer, minimum: 0, maximum: 5, default: 5 }
+
+    ReplayQueued:
+      type: object
+      required: [replay_id]
+      properties:
+        replay_id: { type: string }
+
+    Replay:
+      type: object
+      required: [id, request_id, target_url, status, attempts, updated_at]
+      properties:
+        id: { type: string }
+        request_id: { type: string }
+        target_url: { type: string, format: uri }
+        status:
+          type: string
+          enum: [queued, in_progress, succeeded, failed]
+        attempts: { type: integer }
+        last_error: { type: string, nullable: true }
+        updated_at: { type: string, format: date-time }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        details: { type: string, nullable: true }
