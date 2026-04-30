@@ -209,7 +209,7 @@ async function main() {
 	const replay = new ReplayWorker(store, log);
 	const startedAt = Date.now();
 
-	const app = Fastify({ logger: log, bodyLimit: MAX_BODY_BYTES + 1 });
+	const app = Fastify({ loggerInstance: log, bodyLimit: MAX_BODY_BYTES + 1 });
 	await app.register(cors, {
 		origin: '*',
 		methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
