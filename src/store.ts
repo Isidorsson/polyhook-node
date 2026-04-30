@@ -126,9 +126,13 @@ export class Store {
 			body,
 			received_at: Math.floor(Date.now() / 1000),
 		};
+		// node:sqlite binds BLOB as Uint8Array; Buffer extends Uint8Array but the
+		// runtime's instanceof check is sensitive to its backing ArrayBuffer kind.
+		// Copying into a fresh Uint8Array sidesteps `cannot be bound` errors.
+		const blob = Uint8Array.from(body);
 		this.db
 			.prepare('INSERT INTO requests(id, bin_id, method, headers, body, received_at) VALUES(?,?,?,?,?,?)')
-			.run(req.id, req.bin_id, req.method, JSON.stringify(headers), body, req.received_at);
+			.run(req.id, req.bin_id, req.method, JSON.stringify(headers), blob, req.received_at);
 		return req;
 	}
 

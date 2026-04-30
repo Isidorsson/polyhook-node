@@ -365,6 +365,9 @@ async function main() {
 			'Cache-Control': 'no-cache',
 			Connection: 'keep-alive',
 			'X-Accel-Buffering': 'no',
+			// SSE writes go to reply.raw, bypassing Fastify's hooks — including
+			// @fastify/cors. Set the header manually to match the rest of the API.
+			'Access-Control-Allow-Origin': '*',
 		});
 		reply.raw.write(': ok\n\n');
 
