@@ -217,6 +217,10 @@ async function main() {
 	});
 
 	// Webhook ingest must accept any content-type and preserve raw bytes.
+	// Fastify's default JSON/text parsers take precedence over '*' and would
+	// silently turn a JSON webhook into a parsed object instead of a Buffer,
+	// causing zero-byte bodies. Drop them all and use the buffer parser only.
+	app.removeAllContentTypeParsers();
 	app.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => {
 		done(null, body);
 	});
@@ -388,7 +392,7 @@ async function main() {
 		return reply.hijack();
 	});
 
-	app.post<{ Params: { id: string; rid: string }; Body: { target_url?: string; max_retries?: number } }>(
+	app.post<{ Params: { id: string; rid: string } }>(
 		'/v1/bins/:id/requests/:rid/replay',
 		async (req, reply) => {
 			const bin = store.getBin(req.params.id);
@@ -396,7 +400,17 @@ async function main() {
 			const sourceReq = store.getRequest(req.params.rid);
 			if (!sourceReq || sourceReq.bin_id !== bin.id) return writeErr(reply, 404, 'request not found');
 
-			const body = req.body ?? {};
+			// All bodies arrive as Buffer (the wildcard parser preserves raw bytes
+			// for ingest); parse JSON ourselves on this control-plane endpoint.
+			let body: { target_url?: string; max_retries?: number } = {};
+			const raw = req.body as Buffer | undefined;
+			if (raw && raw.length > 0) {
+				try {
+					body = JSON.parse(raw.toString('utf-8'));
+				} catch {
+					return writeErr(reply, 400, 'invalid JSON body');
+				}
+			}
 			const targetUrl = typeof body.target_url === 'string' ? body.target_url : '';
 			if (!/^https?:\/\//.test(targetUrl)) {
 				return writeErr(reply, 400, 'target_url must be http(s)');
